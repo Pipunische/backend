@@ -1,6 +1,7 @@
 package com.poker.service;
 
 import com.poker.dto.TableDTO;
+import com.poker.dto.events.LobbySnapshotDTO;
 import com.poker.dto.events.TableDetailsDTO;
 import com.poker.dto.events.*;
 import com.poker.util.RedisTopics;
@@ -10,7 +11,6 @@ import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
-import java.util.Map;
 
 @Slf4j
 @Service
@@ -20,45 +20,43 @@ public class GameEventPublisher {
     private final RedisTemplate<String, Object> redisTemplate;
 
     public void publishTableUpdate(TableDetailsDTO tableDetails) {
-        String topic = RedisTopics.getTableTopic(tableDetails.tableId());
-        redisTemplate.convertAndSend(topic, tableDetails);
+        publish(RedisTopics.getTableTopic(tableDetails.tableId()), tableDetails);
     }
 
     public void publishPlayerAction(PlayerActionEvent event) {
-        String topic = RedisTopics.getTableTopic(event.tableId());
-        redisTemplate.convertAndSend(topic, event);
+        publish(RedisTopics.getTableTopic(event.tableId()), event);
     }
 
     public void publishPlayerStatus(PlayerStatusEvent event) {
-        String topic = RedisTopics.getTableTopic(event.tableId());
-        redisTemplate.convertAndSend(topic, event);
+        publish(RedisTopics.getTableTopic(event.tableId()), event);
     }
 
     public void publishFullLobbyUpdate(List<TableDTO> tables) {
-        Map<String, Object> payload = Map.of(
-                "event_type", "LOBBY_UPDATE",
-                "tables", tables
-        );
-        redisTemplate.convertAndSend("poker:lobby", payload);
+        publish("poker:lobby", LobbySnapshotDTO.of(tables));
     }
 
     public void publishLobbyUpdate(String tableId, int currentPlayers, int maxPlayers) {
-        LobbyTableUpdateDTO formA = new LobbyTableUpdateDTO(
-                "LOBBY_UPDATE",
-                tableId,
-                currentPlayers,
-                maxPlayers
-        );
-        redisTemplate.convertAndSend("poker:lobby", formA);
+        publish("poker:lobby", new LobbyTableUpdateDTO("LOBBY_UPDATE", tableId, currentPlayers, maxPlayers));
     }
 
     public void publishWalletUpdate(String userId, long newBalance, String reason) {
-        WalletUpdateEvent event = new WalletUpdateEvent(userId, newBalance, reason);
-        redisTemplate.convertAndSend("poker:wallet:" + userId, event);
+        publish("poker:wallet:" + userId, new WalletUpdateEvent(userId, newBalance, reason));
     }
 
     public void publishStreetEnd(StreetEndDTO event) {
-        String topic = RedisTopics.getTableTopic(event.tableId());
-        redisTemplate.convertAndSend(topic, event);
+        publish(RedisTopics.getTableTopic(event.tableId()), event);
+    }
+
+    /**
+     * Publishing must never propagate: these calls happen inside the table lock and on the turn
+     * timer thread, so a Redis outage would otherwise abort a hand or kill the one-shot timer and
+     * leave the table frozen for every client.
+     */
+    private void publish(String topic, Object payload) {
+        try {
+            redisTemplate.convertAndSend(topic, payload);
+        } catch (Exception e) {
+            log.error("Failed to publish event to Redis topic {}", topic, e);
+        }
     }
 }
