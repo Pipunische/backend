@@ -1,17 +1,26 @@
 package com.poker.service;
 
+import com.poker.config.StompAuthChannelInterceptor;
 import com.poker.dto.TableDTO;
+import com.poker.dto.events.LobbySnapshotDTO;
+import com.poker.dto.events.OnlineUpdateDTO;
 import com.poker.dto.events.TableDetailsDTO;
 import com.poker.model.Table;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.event.EventListener;
+import org.springframework.messaging.Message;
+import org.springframework.messaging.MessageChannel;
+import org.springframework.messaging.MessageHandler;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.messaging.simp.broker.AbstractBrokerMessageHandler;
+import org.springframework.messaging.simp.stomp.StompCommand;
 import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
+import org.springframework.messaging.support.ExecutorChannelInterceptor;
+import org.springframework.messaging.support.MessageHeaderAccessor;
 import org.springframework.stereotype.Component;
-import org.springframework.web.socket.messaging.SessionConnectEvent;
+import org.springframework.web.socket.messaging.SessionConnectedEvent;
 import org.springframework.web.socket.messaging.SessionDisconnectEvent;
-import org.springframework.web.socket.messaging.SessionSubscribeEvent;
 
 import java.util.List;
 import java.util.Map;
@@ -21,102 +30,115 @@ import java.util.concurrent.ConcurrentHashMap;
 @Slf4j
 @Component
 @RequiredArgsConstructor
-public class WebSocketEventListener {
+public class WebSocketEventListener implements ExecutorChannelInterceptor {
+
+    private static final String LOBBY_DESTINATION = "/topic/lobby";
+    private static final String TABLE_DESTINATION_PREFIX = "/topic/table/";
 
     private final TableManager tableManager;
     private final SimpMessagingTemplate messagingTemplate;
 
-    private final Set<String> onlineUsers = ConcurrentHashMap.newKeySet();
-
-    private final Map<String, String> activeUserSessions = new ConcurrentHashMap<>();
+    private final Map<String, Set<String>> sessionsByUser = new ConcurrentHashMap<>();
 
     @EventListener
-    public void handleWebSocketConnectListener(SessionConnectEvent event) {
+    public void handleWebSocketConnectListener(SessionConnectedEvent event) {
         StompHeaderAccessor headerAccessor = StompHeaderAccessor.wrap(event.getMessage());
-        Map<String, Object> sessionAttributes = headerAccessor.getSessionAttributes();
+        String userId = resolveUserId(headerAccessor);
+        String sessionId = headerAccessor.getSessionId();
 
-        if (sessionAttributes != null) {
-            String userId = (String) sessionAttributes.get("userId");
-            String sessionId = headerAccessor.getSessionId();
+        if (userId == null || sessionId == null) {
+            return;
+        }
 
-            if (userId != null) {
-                activeUserSessions.put(userId, sessionId);
-                tableManager.cancelDisconnectTask(userId);
+        boolean firstSession = registerSession(userId, sessionId);
+        tableManager.cancelDisconnectTask(userId);
 
-                boolean isNewUser = onlineUsers.add(userId);
-                if (isNewUser) {
-                    broadcastOnlineCount();
-                }
-
-                sendLobbySnapshotToUser(userId);
-            }
+        if (firstSession) {
+            broadcastOnlineCount();
         }
     }
 
     @EventListener
     public void handleWebSocketDisconnectListener(SessionDisconnectEvent event) {
         StompHeaderAccessor headerAccessor = StompHeaderAccessor.wrap(event.getMessage());
-        Map<String, Object> sessionAttributes = headerAccessor.getSessionAttributes();
+        String userId = resolveUserId(headerAccessor);
+        String sessionId = headerAccessor.getSessionId();
 
-        if (sessionAttributes != null) {
-            String userId = (String) sessionAttributes.get("userId");
-            String disconnectedSessionId = headerAccessor.getSessionId();
+        if (userId == null || sessionId == null) {
+            return;
+        }
 
-            if (userId != null) {
-                String currentActiveSessionId = activeUserSessions.get(userId);
+        boolean wasLastSession = unregisterSession(userId, sessionId);
+        if (!wasLastSession) {
+            log.debug("Session {} of user {} disconnected, other sessions are still open.", sessionId, userId);
+            return;
+        }
 
-                if (currentActiveSessionId != null && !currentActiveSessionId.equals(disconnectedSessionId)) {
-                    log.info("Ghost session {} disconnected for user {}. Ignoring because active session is {}.",
-                            disconnectedSessionId, userId, currentActiveSessionId);
-                    return;
-                }
+        log.info("Last WebSocket session closed for user {}. Scheduling grace period kick...", userId);
+        tableManager.scheduleDisconnectKick(userId);
+        broadcastOnlineCount();
+    }
 
-                log.info("Active WebSocket disconnect for user: {}. Scheduling grace period kick...", userId);
-                activeUserSessions.remove(userId);
-                tableManager.scheduleDisconnectKick(userId);
+    // Not a SessionSubscribeEvent listener: that event fires before the broker registers the
+    // subscription, and the simple broker drops messages sent to a destination with no subscriber.
+    @Override
+    public void afterMessageHandled(Message<?> message, MessageChannel channel, MessageHandler handler, Exception ex) {
+        if (ex != null || !(handler instanceof AbstractBrokerMessageHandler)) {
+            return;
+        }
 
-                onlineUsers.remove(userId);
-                broadcastOnlineCount();
-            }
+        StompHeaderAccessor accessor = MessageHeaderAccessor.getAccessor(message, StompHeaderAccessor.class);
+        if (accessor == null || !StompCommand.SUBSCRIBE.equals(accessor.getCommand())) {
+            return;
+        }
+
+        String userId = resolveUserId(accessor);
+        String destination = accessor.getDestination();
+        if (userId == null || destination == null) {
+            return;
+        }
+
+        if (LOBBY_DESTINATION.equals(destination)) {
+            broadcastOnlineCount();
+            sendLobbySnapshotToUser(userId);
+        } else if (destination.startsWith(TABLE_DESTINATION_PREFIX)) {
+            tableManager.cancelDisconnectTask(userId);
+            sendTableSnapshotToUser(userId, destination.substring(TABLE_DESTINATION_PREFIX.length()));
         }
     }
 
-    @EventListener
-    public void handleWebSocketSubscribeListener(SessionSubscribeEvent event) {
-        StompHeaderAccessor headerAccessor = StompHeaderAccessor.wrap(event.getMessage());
-        Map<String, Object> sessionAttributes = headerAccessor.getSessionAttributes();
+    public int getOnlineCount() {
+        return sessionsByUser.size();
+    }
 
-        if (sessionAttributes != null) {
-            String userId = (String) sessionAttributes.get("userId");
-            String destination = headerAccessor.getDestination();
+    public void broadcastOnlineCount() {
+        messagingTemplate.convertAndSend(LOBBY_DESTINATION, new OnlineUpdateDTO("ONLINE_UPDATE", getOnlineCount()));
+    }
 
-            if (userId != null && destination != null && destination.equals("/topic/lobby")) {
-                broadcastOnlineCount();
-                sendLobbySnapshotToUser(userId);
+    private boolean registerSession(String userId, String sessionId) {
+        boolean[] firstSession = new boolean[1];
+        sessionsByUser.compute(userId, (key, sessions) -> {
+            if (sessions == null) {
+                sessions = ConcurrentHashMap.newKeySet();
+                firstSession[0] = true;
             }
+            sessions.add(sessionId);
+            return sessions;
+        });
+        return firstSession[0];
+    }
 
-            if (userId != null && destination != null && destination.startsWith("/topic/table/")) {
-                log.info("User {} subscribed to {}. Canceling grace period kick...", userId, destination);
-                tableManager.cancelDisconnectTask(userId);
-
-                String tableId = destination.substring("/topic/table/".length());
-
-                Table table = tableManager.getTable(tableId);
-                if (table != null) {
-                    try {
-                        TableDetailsDTO snapshot = TableDetailsDTO.createTableDetailsDTO(table, userId, true);
-                        messagingTemplate.convertAndSendToUser(
-                                userId,
-                                "/queue/table_snapshot",
-                                snapshot
-                        );
-                        log.info("Sent TABLE_UPDATE snapshot to user {}", userId);
-                    } catch (Exception e) {
-                        log.error("Failed to build or send snapshot for table {} to user {}", tableId, userId, e);
-                    }
-                }
+    private boolean unregisterSession(String userId, String sessionId) {
+        boolean[] lastSession = new boolean[1];
+        sessionsByUser.computeIfPresent(userId, (key, sessions) -> {
+            sessions.remove(sessionId);
+            if (sessions.isEmpty()) {
+                lastSession[0] = true;
+                return null;
             }
-        }
+            return sessions;
+        });
+        return lastSession[0];
     }
 
     private void sendLobbySnapshotToUser(String userId) {
@@ -124,23 +146,32 @@ public class WebSocketEventListener {
                 .map(TableDTO::createTableDTO)
                 .toList();
 
-        Map<String, Object> lobbySnapshot = Map.of(
-                "event_type", "LOBBY_UPDATE",
-                "tables", currentLobby
-        );
-
         messagingTemplate.convertAndSendToUser(
                 userId,
                 "/queue/lobby_snapshot",
-                lobbySnapshot
+                LobbySnapshotDTO.of(currentLobby)
         );
     }
 
-    private void broadcastOnlineCount() {
-        Map<String, Object> payload = Map.of(
-                "event_type", "ONLINE_UPDATE",
-                "online_count", onlineUsers.size()
-        );
-        messagingTemplate.convertAndSend("/topic/lobby", payload);
+    private void sendTableSnapshotToUser(String userId, String tableId) {
+        Table table = tableManager.getTable(tableId);
+        if (table == null) {
+            return;
+        }
+
+        try {
+            TableDetailsDTO snapshot = TableDetailsDTO.createTableDetailsDTO(table, userId, true);
+            messagingTemplate.convertAndSendToUser(userId, "/queue/table_snapshot", snapshot);
+            log.info("Sent TABLE_UPDATE snapshot for table {} to user {}", tableId, userId);
+        } catch (Exception e) {
+            log.error("Failed to build or send snapshot for table {} to user {}", tableId, userId, e);
+        }
+    }
+
+    private String resolveUserId(StompHeaderAccessor accessor) {
+        Map<String, Object> sessionAttributes = accessor.getSessionAttributes();
+        return sessionAttributes == null
+                ? null
+                : (String) sessionAttributes.get(StompAuthChannelInterceptor.USER_ID_ATTRIBUTE);
     }
 }
