@@ -1,48 +1,64 @@
 package com.poker.config;
 
-import com.poker.service.AccountService;
+import com.poker.service.WebSocketEventListener;
+import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Lazy;
-import org.springframework.messaging.Message;
-import org.springframework.messaging.MessageChannel;
 import org.springframework.messaging.simp.config.ChannelRegistration;
 import org.springframework.messaging.simp.config.MessageBrokerRegistry;
-import org.springframework.messaging.simp.stomp.StompCommand;
-import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
-import org.springframework.messaging.support.ChannelInterceptor;
-import org.springframework.messaging.support.MessageHeaderAccessor;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 import org.springframework.web.socket.config.annotation.EnableWebSocketMessageBroker;
 import org.springframework.web.socket.config.annotation.StompEndpointRegistry;
 import org.springframework.web.socket.config.annotation.WebSocketMessageBrokerConfigurer;
-
-import java.util.List;
+import org.springframework.web.socket.config.annotation.WebSocketTransportRegistration;
 
 @Slf4j
 @Configuration
 @EnableWebSocketMessageBroker
 public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 
-    private final AccountService accountService;
+    private static final long HEARTBEAT_INTERVAL_MS = 20_000;
+    private static final int MESSAGE_SIZE_LIMIT = 128 * 1024;
+    private static final int SEND_BUFFER_SIZE_LIMIT = 1024 * 1024;
+    private static final int SEND_TIME_LIMIT_MS = 20_000;
 
-    public WebSocketConfig(@Lazy AccountService accountService) {
-        this.accountService = accountService;
+    private final StompAuthChannelInterceptor authChannelInterceptor;
+    private final WebSocketEventListener webSocketEventListener;
+
+    private ThreadPoolTaskScheduler heartbeatScheduler;
+
+    public WebSocketConfig(StompAuthChannelInterceptor authChannelInterceptor,
+                           @Lazy WebSocketEventListener webSocketEventListener) {
+        this.authChannelInterceptor = authChannelInterceptor;
+        this.webSocketEventListener = webSocketEventListener;
     }
 
     @Override
     public void configureMessageBroker(MessageBrokerRegistry config) {
-        ThreadPoolTaskScheduler taskScheduler = new ThreadPoolTaskScheduler();
-        taskScheduler.setPoolSize(1);
-        taskScheduler.setThreadNamePrefix("ws-heartbeat-thread-");
-        taskScheduler.initialize();
+        this.heartbeatScheduler = new ThreadPoolTaskScheduler();
+        this.heartbeatScheduler.setPoolSize(2);
+        this.heartbeatScheduler.setThreadNamePrefix("ws-heartbeat-");
+        this.heartbeatScheduler.setDaemon(true);
+        this.heartbeatScheduler.initialize();
 
         config.enableSimpleBroker("/topic", "/queue")
-                .setHeartbeatValue(new long[]{20000, 20000})
-                .setTaskScheduler(taskScheduler);
+                .setHeartbeatValue(new long[]{HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS})
+                .setTaskScheduler(this.heartbeatScheduler);
 
         config.setApplicationDestinationPrefixes("/app");
         config.setUserDestinationPrefix("/user");
+
+        // Game state is only meaningful in order: without this a client can render a stale
+        // TABLE_UPDATE after a newer one because frames for one session may run on different threads.
+        config.setPreservePublishOrder(true);
+    }
+
+    @PreDestroy
+    public void shutdownHeartbeatScheduler() {
+        if (this.heartbeatScheduler != null) {
+            this.heartbeatScheduler.shutdown();
+        }
     }
 
     @Override
@@ -52,63 +68,14 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
     }
 
     @Override
+    public void configureWebSocketTransport(WebSocketTransportRegistration registration) {
+        registration.setMessageSizeLimit(MESSAGE_SIZE_LIMIT);
+        registration.setSendBufferSizeLimit(SEND_BUFFER_SIZE_LIMIT);
+        registration.setSendTimeLimit(SEND_TIME_LIMIT_MS);
+    }
+
+    @Override
     public void configureClientInboundChannel(ChannelRegistration registration) {
-        registration.interceptors(new ChannelInterceptor() {
-            @Override
-            public Message<?> preSend(Message<?> message, MessageChannel channel) {
-                StompHeaderAccessor accessor = MessageHeaderAccessor.getAccessor(message, StompHeaderAccessor.class);
-
-                if (accessor == null || accessor.getCommand() == null) {
-                    return message;
-                }
-
-                if (StompCommand.CONNECT.equals(accessor.getCommand())) {
-                    List<String> authHeaders = accessor.getNativeHeader("Authorization");
-
-                    if (authHeaders != null && !authHeaders.isEmpty()) {
-                        String rawHeader = authHeaders.get(0);
-                        String token = null;
-
-                        if (rawHeader.startsWith("Bearer ")) {
-                            token = rawHeader.substring(7);
-                        }
-
-                        if (token != null && !token.isBlank() && token.contains(".")) {
-                            try {
-                                String userId = accountService.getUserIdByToken(token);
-                                if (userId != null) {
-                                    accessor.getSessionAttributes().put("userId", userId);
-                                    accessor.getSessionAttributes().put("jwtToken", token);
-                                    accessor.setUser(() -> userId);
-                                }
-                            } catch (Exception e) {
-                                log.warn("WS Connect rejected: invalid token");
-                                throw new IllegalArgumentException("Invalid token");
-                            }
-                        }
-                    }
-                } else if (StompCommand.SUBSCRIBE.equals(accessor.getCommand())) {
-                    String token = (String) accessor.getSessionAttributes().get("jwtToken");
-
-                    if (token == null) {
-                        log.warn("WS Subscribe rejected: No token in session");
-                        throw new IllegalArgumentException("Unauthorized");
-                    }
-
-                    try {
-                        String userId = accountService.getUserIdByToken(token);
-                        if (userId == null) {
-                            log.warn("WS Subscribe rejected: Token expired during active session");
-                            throw new IllegalArgumentException("Token expired");
-                        }
-                    } catch (Exception e) {
-                        log.warn("WS Subscribe rejected: Token validation failed");
-                        throw new IllegalArgumentException("Token expired");
-                    }
-                }
-
-                return message;
-            }
-        });
+        registration.interceptors(authChannelInterceptor, webSocketEventListener);
     }
 }
