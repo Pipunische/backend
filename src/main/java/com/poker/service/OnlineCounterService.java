@@ -1,27 +1,24 @@
 package com.poker.service;
 
-import com.poker.dto.events.OnlineUpdateDTO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.messaging.simp.SimpMessagingTemplate;
-import org.springframework.messaging.simp.user.SimpUserRegistry;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
+/**
+ * Periodic re-broadcast of the online counter so that clients that missed an update converge.
+ * The count itself is owned by {@link WebSocketEventListener}; publishing a second, independently
+ * derived number here would make the value flicker between two sources of truth.
+ */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class OnlineCounterService {
 
-    private final SimpMessagingTemplate messagingTemplate;
-    private final SimpUserRegistry userRegistry;
+    private final WebSocketEventListener webSocketEventListener;
 
     @Scheduled(fixedRate = 10000)
     public void broadcastOnlineCount() {
-        int onlineCount = userRegistry.getUserCount();
-
-        OnlineUpdateDTO payload = new OnlineUpdateDTO("ONLINE_UPDATE", onlineCount);
-
-        messagingTemplate.convertAndSend("/topic/lobby", payload);
+        webSocketEventListener.broadcastOnlineCount();
     }
 }
