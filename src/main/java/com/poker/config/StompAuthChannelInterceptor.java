@@ -15,11 +15,6 @@ import org.springframework.stereotype.Component;
 import java.util.List;
 import java.util.Map;
 
-/**
- * Authenticates the STOMP session once, when the CONNECT frame arrives. Every later frame is
- * authorized against the principal bound to the session, so a short-lived access token cannot
- * tear down a long-running game connection halfway through a hand.
- */
 @Slf4j
 @Component
 public class StompAuthChannelInterceptor implements ChannelInterceptor {

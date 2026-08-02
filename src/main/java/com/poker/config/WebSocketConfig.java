@@ -48,9 +48,6 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 
         config.setApplicationDestinationPrefixes("/app");
         config.setUserDestinationPrefix("/user");
-
-        // Game state is only meaningful in order: without this a client can render a stale
-        // TABLE_UPDATE after a newer one because frames for one session may run on different threads.
         config.setPreservePublishOrder(true);
     }
 

@@ -68,7 +68,8 @@ public class WebSocketEventListener implements ExecutorChannelInterceptor {
             return;
         }
 
-        if (!unregisterSession(userId, sessionId)) {
+        boolean wasLastSession = unregisterSession(userId, sessionId);
+        if (!wasLastSession) {
             log.debug("Session {} of user {} disconnected, other sessions are still open.", sessionId, userId);
             return;
         }
@@ -78,11 +79,8 @@ public class WebSocketEventListener implements ExecutorChannelInterceptor {
         broadcastOnlineCount();
     }
 
-    /**
-     * Snapshots have to be pushed once the broker has registered the subscription. Reacting to
-     * {@code SessionSubscribeEvent} instead would publish into a destination nobody is subscribed
-     * to yet, and the simple broker silently drops those messages.
-     */
+    // Not a SessionSubscribeEvent listener: that event fires before the broker registers the
+    // subscription, and the simple broker drops messages sent to a destination with no subscriber.
     @Override
     public void afterMessageHandled(Message<?> message, MessageChannel channel, MessageHandler handler, Exception ex) {
         if (ex != null || !(handler instanceof AbstractBrokerMessageHandler)) {
@@ -130,9 +128,6 @@ public class WebSocketEventListener implements ExecutorChannelInterceptor {
         return firstSession[0];
     }
 
-    /**
-     * @return {@code true} when the user has no remaining sessions.
-     */
     private boolean unregisterSession(String userId, String sessionId) {
         boolean[] lastSession = new boolean[1];
         sessionsByUser.computeIfPresent(userId, (key, sessions) -> {

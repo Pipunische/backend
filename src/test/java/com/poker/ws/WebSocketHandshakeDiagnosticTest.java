@@ -39,11 +39,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.when;
 
-/**
- * Drives a real STOMP client against the endpoint to cover the connection lifecycle:
- * authentication happens once at CONNECT, and the lobby snapshot has to survive the
- * subscribe round-trip.
- */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class WebSocketHandshakeDiagnosticTest {
 
